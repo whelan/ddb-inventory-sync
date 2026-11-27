@@ -31,21 +31,22 @@ export function nameVariants(name) {
 }
 
 /**
- * Build a name → definition index. Homebrew wins over an official item of the
- * same name, because a vault item pushed to D&D Beyond homebrew is the one
- * this campaign means.
- * @param {Array<{id:number, entityTypeId:number, name:string, isHomebrew?:boolean}>} definitions
+ * Build a name → definition index. When several definitions share a name the
+ * best one wins: homebrew (a vault item pushed to D&D Beyond is the one this
+ * campaign means) over a current official item over a legacy one (2014 and
+ * 2024 printings of "Potion of Healing" share the name).
+ * @param {Array<{id:number, entityTypeId:number, name:string, isHomebrew?:boolean, isLegacy?:boolean}>} definitions
  */
 export function buildIndex(definitions) {
+  const rank = (d) => (d.isHomebrew ? 3 : d.isLegacy ? 1 : 2);
   const index = new Map();
   for (const def of definitions ?? []) {
     const d = def?.definition ?? def; // tolerate wrapped rows
     if (!d || !Number.isInteger(d.id) || !Number.isInteger(d.entityTypeId) || !d.name) continue;
     const key = normalizeName(d.name);
+    const entry = { id: d.id, entityTypeId: d.entityTypeId, name: d.name, isHomebrew: !!d.isHomebrew, isLegacy: !!d.isLegacy };
     const existing = index.get(key);
-    if (!existing || (d.isHomebrew && !existing.isHomebrew)) {
-      index.set(key, { id: d.id, entityTypeId: d.entityTypeId, name: d.name, isHomebrew: !!d.isHomebrew });
-    }
+    if (!existing || rank(entry) > rank(existing)) index.set(key, entry);
   }
   return index;
 }

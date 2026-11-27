@@ -1,6 +1,26 @@
 import { MODULE_ID } from './core/constants.js';
 
-export function registerSettings() {
+export function registerSettings(menus = {}) {
+  if (menus.DiagnosticsMenu) {
+    game.settings.registerMenu(MODULE_ID, 'diagnostics', {
+      name: 'Diagnostics',
+      label: 'Run diagnostics',
+      hint: 'Checks proxy, cookies, character mapping, party and item list. Writes nothing; the report is whispered to the GM.',
+      icon: 'fas fa-stethoscope',
+      type: menus.DiagnosticsMenu,
+      restricted: true
+    });
+  }
+  if (menus.SelfTestMenu) {
+    game.settings.registerMenu(MODULE_ID, 'selfTest', {
+      name: 'Live self-test',
+      label: 'Run live self-test',
+      hint: 'Round trip against a D&D Beyond TEST character: adds, changes and removes a test item, a copper and a custom item, and cleans up.',
+      icon: 'fas fa-vial',
+      type: menus.SelfTestMenu,
+      restricted: true
+    });
+  }
   const world = (key, data) => game.settings.register(MODULE_ID, key, { scope: 'world', config: true, ...data });
   const client = (key, data) => game.settings.register(MODULE_ID, key, { scope: 'client', ...data });
 
@@ -28,6 +48,19 @@ export function registerSettings() {
     type: String,
     choices: { custom: 'Create a custom item', skip: 'Skip and warn' },
     default: 'custom'
+  });
+  world('currencyMode', {
+    name: 'How changes are applied',
+    hint: 'Delta: read the character on D&D Beyond and apply the Foundry change to it, so what a player changed on the D&D Beyond sheet survives. Absolute: overwrite D&D Beyond with the Foundry value. The party inventory is always absolute.',
+    type: String,
+    choices: { delta: 'Delta (recommended)', absolute: 'Absolute' },
+    default: 'delta'
+  });
+  world('verifyWrites', {
+    name: 'Verify writes',
+    hint: 'Read every character write back from D&D Beyond and report a mismatch. One extra call per change; turn off once trusted.',
+    type: Boolean,
+    default: true
   });
   world('syncCurrency', { name: 'Sync coins', type: Boolean, default: true });
   world('syncEquipped', { name: 'Sync equipped / attuned', type: Boolean, default: true });
@@ -66,6 +99,7 @@ export function registerSettings() {
     config: true
   });
   client('characterCobalts', { type: Object, default: {}, config: false });
+  client('debug', { name: 'Debug logging', hint: 'Also print skipped changes to the console.', type: Boolean, default: false, config: true });
 }
 
 export const setting = (key) => game.settings.get(MODULE_ID, key);

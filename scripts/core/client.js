@@ -12,7 +12,7 @@ export class ProxyClient {
   constructor({ proxyUrl, cobaltFor, fetch: fetchImpl = globalThis.fetch?.bind(globalThis), timeoutMs = 15000 }) {
     this.proxyUrl = proxyUrl;
     this.cobaltFor = cobaltFor;
-    this.fetch = fetchImpl;
+    this.fetch = (...args) => fetchImpl(...args);
     this.timeoutMs = timeoutMs;
   }
 

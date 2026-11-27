@@ -58,3 +58,24 @@ export function looksLikeImport(batch, limit) {
   const imported = batch.filter((d) => Number.isInteger(d?.flags?.ddbimporter?.id)).length;
   return imported * 2 >= batch.length;
 }
+
+/**
+ * Find the D&D Beyond row a Foundry item corresponds to when it has no stored
+ * row id: same definition (or, for custom rows, same name), not claimed by
+ * another item, preferring the row whose quantity matches.
+ * @param {Array<{id:number, definitionId:number|null, name:string, quantity:number}>} rows
+ * @param {{definitionId?:number|null, name:string}} ref
+ * @param {{isClaimed?:(id:number)=>boolean, quantity?:number|null}} [opts]
+ */
+export function findRowFor(rows, ref, { isClaimed = () => false, quantity = null } = {}) {
+  const name = normalizeName(ref?.name);
+  const candidates = (rows ?? []).filter(
+    (r) =>
+      !isClaimed(r.id) &&
+      ((ref?.definitionId && r.definitionId === ref.definitionId) || (name && normalizeName(r.name) === name))
+  );
+  if (!candidates.length) return null;
+  const byDefinition = ref?.definitionId ? candidates.filter((r) => r.definitionId === ref.definitionId) : [];
+  const pool = byDefinition.length ? byDefinition : candidates;
+  return (quantity != null && pool.find((r) => r.quantity === quantity)) || pool[pool.length - 1];
+}

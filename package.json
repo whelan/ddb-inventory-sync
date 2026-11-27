@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Foundry VTT module: Item Piles / Foundry inventory -> D&D Beyond via ddb-proxy",
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "mock": "node tools/mock-proxy.js"
   },
   "license": "MIT"
 }

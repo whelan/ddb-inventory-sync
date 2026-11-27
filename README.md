@@ -41,14 +41,18 @@ Updates arrive through the same URL. A release is published by the Release workf
 2. Install the module, enable it. With ddb-sync installed, its proxy URL, cobalt cookie,
    campaign ID and character mapping are used when this module's own settings are empty.
 3. Settings → **Party actor ID**: the actor that is the party stash (optional).
-4. In the console, per character, check the connection and pair existing items with their
-   D&D Beyond rows (once, before the first session with sync on):
+4. Settings → **Run diagnostics**: checks proxy, cookies, mapping, party and item list and
+   whispers the report to the GM. Writes nothing.
+5. Settings → **Run live self-test** on a *test* character: a full round trip on D&D Beyond that
+   cleans up after itself.
+6. Pair existing items with their D&D Beyond rows once per character (items that are not linked
+   are also linked on the fly by name):
    ```js
-   const api = game.modules.get('ddb-inventory-sync').api;
-   await api.test(game.actors.getName('Ireena'));   // reads only
-   await api.link(game.actors.getName('Ireena'));   // sets row ids on existing items
+   await game.modules.get('ddb-inventory-sync').api.link(game.actors.getName('Ireena'));
    ```
-5. Keep **Dry run** on for a session, read `api.log`, then turn it off.
+7. Keep **Dry run** on for a session, read `api.log`, then turn it off.
+
+How to test all of it, first against a mock with no risk: **[TESTING.md](TESTING.md)**.
 
 ### Whose cookie writes?
 
@@ -65,36 +69,34 @@ player's character, store that player's cookie in the GM browser (never in world
    homebrew therefore arrive as real items.
 4. Otherwise a **custom item** (name, description, cost, weight) — or skip, by setting.
 
+## Delta or absolute
+
+Players also use the D&D Beyond sheet. In **delta** mode (default) a character is read from
+D&D Beyond before each change and the Foundry difference is applied to it, so a potion a player
+drank on D&D Beyond or gold spent there is not undone by the next Foundry trade. **Absolute**
+mode overwrites D&D Beyond with the Foundry value. The party inventory cannot be read through a
+character, so party coins are always absolute.
+
 ## Safety rails
 
-- Off by default; **dry run** on by default.
-- **Import guard**: a burst of new items on one actor that mostly carry D&D Beyond ids
-  (DDB Importer rebuilding a sheet) is not sent back.
-- Pass `{ 'ddb-inventory-sync': { skip: true } }` in an operation's options to keep a change local.
-- Per-character serial queue; a newer purse or stack size replaces a waiting one.
-- A warning appears if DDB Importer's dynamic sync is on too (changes would be sent twice).
+- Off by default; **dry run** on by default (reads are allowed, writes are logged only).
+- **Import guard**: a DDB Importer rebuild (a burst of creates or deletes of items that carry
+  D&D Beyond ids, or updates that change more than inventory fields) is not sent back.
+- **Verify writes**: each character write is read back and a mismatch reported.
+- Transient errors are retried; rejected writes are kept: `api.failed`, `api.retryFailed()`.
+- If the D&D Beyond item list cannot be loaded, adds fail instead of becoming custom items.
+- `api.pause()` / `api.resume()`, and `{ 'ddb-inventory-sync': { skip: true } }` in an
+  operation's options keeps a change local.
+- A warning appears if DDB Importer's dynamic sync is on too.
 
-## Verify against D&D Beyond before trusting it
-
-The endpoints and bodies are the ones D&D Beyond's own character sheet sends (read from its
-public character-app bundle). They are unofficial. Check these once on a test character, with
-dry run off:
-
-- [ ] `api.test(actor)` reads the inventory.
-- [ ] Add a known item (Potion of Healing) — appears on D&D Beyond, row id is stored.
-- [ ] Change its quantity, then delete it.
-- [ ] Coins: set gp on the actor — D&D Beyond shows the same purse (absolute set, not a delta).
-- [ ] Unknown item → custom item appears.
-- [ ] Party actor: add an item — appears under Party Inventory in the campaign.
-- [ ] Party coins.
-- [ ] Your cobalt on a player's character — allowed, or a player cookie is needed.
+Every situation and the test that covers it: [docs/EDGE-CASES.md](docs/EDGE-CASES.md).
 
 ## Development
 
 ```bash
-npm test   # node --test, no dependencies
+npm test        # unit + scenario tests (main.js in a Foundry stand-in, against the mock over HTTP)
+npm run mock    # mock ddb-proxy + D&D Beyond with a live status page on http://localhost:3999
 ```
 
 `scripts/core/` is pure and unit-tested (matcher, planner, queue, engine, targets, linker,
-client); `scripts/main.js` is the thin Foundry glue, exercised by `tests/glue.test.js`
-against a minimal Foundry stand-in.
+client, selftest); `scripts/main.js` is the Foundry glue.

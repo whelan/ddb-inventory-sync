@@ -4,17 +4,20 @@
  * D&D Beyond applies a character's inventory calls in order, and an add must
  * land before the quantity change or removal that follows it, so every
  * character gets one lane. A newer op with the same coalesce key replaces a
- * still-waiting one (only the latest purse or stack size matters).
+ * still-waiting one; `merge(older, newer)` decides how (latest value, summed
+ * deltas). A failed op goes to `failed` so it can be retried.
  */
 export class SyncQueue {
   /**
    * @param {(op:object) => Promise<void>} run
-   * @param {{coalesceKey?: (op:object)=>string|null, onError?: (op:object, err:Error)=>void}} [opts]
+   * @param {{coalesceKey?: (op:object)=>string|null, merge?: (older:object, newer:object)=>object, onError?: (op:object, err:Error)=>void}} [opts]
    */
-  constructor(run, { coalesceKey = () => null, onError = () => {} } = {}) {
+  constructor(run, { coalesceKey = () => null, merge = (older, newer) => newer, onError = () => {} } = {}) {
     this.run = run;
     this.coalesceKey = coalesceKey;
+    this.merge = merge;
     this.onError = onError;
+    this.failed = []; // { op, error, at }
     this.lanes = new Map(); // characterId -> { pending: op[], running: Promise|null }
   }
 
@@ -29,7 +32,7 @@ export class SyncQueue {
     if (key) {
       const i = lane.pending.findIndex((p) => this.coalesceKey(p) === key);
       if (i !== -1) {
-        lane.pending[i] = op;
+        lane.pending[i] = this.merge(lane.pending[i], op);
         return lane.running ?? Promise.resolve();
       }
     }
@@ -44,11 +47,20 @@ export class SyncQueue {
       try {
         await this.run(op);
       } catch (err) {
+        this.failed.push({ op, error: err?.message ?? String(err), at: new Date().toISOString() });
+        if (this.failed.length > 100) this.failed.shift();
         this.onError(op, err);
       }
     }
     lane.running = null;
     this.lanes.delete(id);
+  }
+
+  /** Put every failed op back in its lane; returns how many. */
+  retryFailed() {
+    const ops = this.failed.splice(0).map((f) => f.op);
+    for (const op of ops) this.push(op);
+    return ops.length;
   }
 
   /** Resolves when every lane is empty. */
