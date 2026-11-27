@@ -6,6 +6,7 @@ Three levels, from no risk to a real character. Do them in order.
 |---|---|---|---|
 | 1. `npm test` | All logic and 25+ table scenarios | No | 15 s |
 | 2. Foundry against the mock | The module in your real world, Item Piles included | No | 15 min |
+| 2b. Scenarios via Item Piles (by hand or a local Claude) | The table situations, played by Item Piles' own API, checked after every step | No (mock) | 2 min |
 | 3. Live self-test + table check | D&D Beyond accepts the calls the way we assume | A **test** character | 15 min |
 
 Every edge case and the test that covers it: [docs/EDGE-CASES.md](docs/EDGE-CASES.md).
@@ -64,6 +65,27 @@ loot take, trade, import, player editing on D&D Beyond, outages) against
    api.retryFailed();
    api.pause(); api.resume();
    ```
+
+## 2b. Scenario runner (Item Piles, automated — also for a local Claude)
+
+The module keeps a world macro **`DDB Inventory Sync: Test`**. It creates a test merchant and a
+loot pile, then plays these through Item Piles' API on a synced character: 250 gp pocket money,
+buy, buy again (same stack), sell back, take the loot pile, use a torch, a player editing on D&D
+Beyond (mock only), give a dagger to another PC, and the party stash. After every step it checks
+that each test item has a D&D Beyond row with the same stack and that coins moved by the same
+amount. Then it removes everything again. The report is whispered to the GM and returned as JSON.
+
+- **By hand:** run the macro from the hotbar or the macro directory.
+- **From a local Claude** with foundry-mcp-bridge: turn on *Allow the bridge to run macros* in
+  the bridge's settings, then ask Claude to "test the DDB sync". The skill
+  `.claude/skills/test-ddb-inventory-sync` tells it how: start the mock, call `run_macro`
+  with `{ configure: { proxyUrl: "http://localhost:3999", enabled: true, dryRun: false } }`,
+  read the report, inject faults through the mock, re-run, and restore the settings.
+- **Against a real proxy** it refuses unless called with `{ live: true, actor: "<test character>" }`.
+
+Arguments: `actor`, `otherActor`, `only: ["buy","sell","loot","use","playerEdit","give","party"]`,
+`keep`, `live`, `configure: { proxyUrl, enabled, dryRun, currencyMode, verifyWrites }`, `chat`.
+Without Item Piles active, the same scenarios run as plain Foundry document changes.
 
 ## 3. Live, on a D&D Beyond TEST character
 

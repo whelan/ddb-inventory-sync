@@ -52,7 +52,10 @@ Updates arrive through the same URL. A release is published by the Release workf
    ```
 7. Keep **Dry run** on for a session, read `api.log`, then turn it off.
 
-How to test all of it, first against a mock with no risk: **[TESTING.md](TESTING.md)**.
+How to test all of it, first against a mock with no risk: **[TESTING.md](TESTING.md)**. The world
+macro **DDB Inventory Sync: Test** plays merchant, loot, give, party and coin scenarios through
+Item Piles and checks D&D Beyond after every step. A local Claude can run it through
+foundry-mcp-bridge's `run_macro` (skill: `.claude/skills/test-ddb-inventory-sync`).
 
 ### Whose cookie writes?
 

@@ -2,7 +2,7 @@
 
 What the module does in each situation, and the test that holds it there
 (`core` = `tests/core.test.js`, `glue` = `tests/glue.test.js`, `proxy` = `whelan/ddb-proxy`
-`test/inventory.e2e.test.js`).
+`test/inventory.e2e.test.js`, `scenarios` = `tests/scenarios.test.js`, the Item Piles runner).
 
 ## Who sends, and what is ignored
 
@@ -85,3 +85,13 @@ and applies the Foundry change to what D&D Beyond holds.
 | Coin call adds instead of setting | Detected, opposite call restores the purse, reported ❌ | glue *self-test catches a currency call that adds* |
 | Anything it created | Removed again; a failed cleanup is reported with the row id | glue *self-test passes … leaves nothing behind* |
 | Test character not in the party's campaign | Party step skipped with a warning | selftest |
+
+## Item Piles, played for real
+
+`tests/scenarios.test.js` runs the scenario runner (the world macro) against a fake Item Piles
+with Item Piles' behaviour: stacks merge by name, purchases cost the price, selling pays half,
+and transfers copy item flags. A run covers merchant buy, buy again, sell back, loot pile
+take-all with a custom item, use, a player editing on D&D Beyond, give to another PC, and the
+party stash. The checks run after every step, then cleanup returns D&D Beyond to where it was.
+The same file shows that a wrong coin call fails a step, that dry run, leftovers and a non-mock
+proxy are refused, and that the runner also works without Item Piles.

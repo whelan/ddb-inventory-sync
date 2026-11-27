@@ -88,6 +88,12 @@ export function registerSettings(menus = {}) {
     type: String,
     default: ''
   });
+  world('provideTestMacro', {
+    name: 'Provide the test macro',
+    hint: 'Keep a script macro "DDB Inventory Sync: Test" in the world that plays Item Piles scenarios (for testing, also from a local Claude via foundry-mcp-bridge run_macro).',
+    type: Boolean,
+    default: true
+  });
   world('notifyFailures', { name: 'Notify GM on sync failures', type: Boolean, default: true });
 
   // Secrets live in the GM's browser only, never in world data that players receive.

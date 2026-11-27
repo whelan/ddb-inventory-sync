@@ -110,9 +110,38 @@ export function installFoundry() {
       Hooks.call('updateActor', this, changes, options, 'user');
       return this;
     }
+    async createEmbeddedDocuments(type, list, options = {}) {
+      const out = [];
+      for (const data of list) out.push(await this.createItem(data, options));
+      return out;
+    }
+    async delete() {
+      actors.delete(this.id);
+    }
+    static async create(data) {
+      return addActor({ id: `actor${nextId++}`, name: data.name });
+    }
   }
 
   const actors = new Collection();
+  const macros = new Collection();
+  class Macro {
+    constructor(data) {
+      Object.assign(this, { id: `macro${nextId++}`, ...data });
+    }
+    async update(changes) {
+      Object.assign(this, changes);
+    }
+    async execute(scope = {}) {
+      const fn = new (Object.getPrototypeOf(async function () {}).constructor)('scope', this.command);
+      return fn(scope);
+    }
+    static async create(data) {
+      const m = new Macro(data);
+      macros.set(m.id, m);
+      return m;
+    }
+  }
   const users = [{ id: 'gm', isGM: true }, { id: 'p1', isGM: false }];
   const game = {
     settings: {
@@ -129,7 +158,8 @@ export function installFoundry() {
     users: Object.assign(users, { activeGM: { isSelf: true } }),
     user: { isGM: true },
     modules: new Map([['ddb-inventory-sync', { active: true }], ['item-piles', { active: true }], ['ddb-sync', { active: true }]]),
-    actors
+    actors,
+    macros
   };
 
   Object.assign(globalThis, {
@@ -137,6 +167,8 @@ export function installFoundry() {
     game,
     ui: { notifications: { warn: (m) => notes.push(['warn', m]), error: (m) => notes.push(['error', m]), info: (m) => notes.push(['info', m]) } },
     fromUuidSync: (uuid) => docs.get(uuid) ?? null,
+    Actor,
+    Macro,
     ChatMessage: { create: async (data) => chat.push(data) },
     foundry: {
       utils: {
@@ -153,5 +185,92 @@ export function installFoundry() {
     return a;
   };
   const set = (mod, key, value) => settings.set(`${mod}.${key}`, value);
-  return { Hooks, game, settings, set, addActor, Actor, chat, notes };
+  return { Hooks, game, settings, set, addActor, Actor, chat, notes, installItemPiles: () => (game.itempiles = { API: fakeItemPiles() }) };
+}
+
+/**
+ * Item Piles stand-in with the behaviour the scenarios rely on: stacks merge
+ * by name, a purchase costs the item's price, selling to a merchant pays half,
+ * transfers copy the item data (flags included, as Item Piles does).
+ */
+function fakeItemPiles() {
+  const COINS = ['cp', 'sp', 'ep', 'gp', 'pp'];
+  const parse = (str) => {
+    const out = {};
+    for (const m of String(str).matchAll(/(\d+)\s*(cp|sp|ep|gp|pp)/g)) out[m[2]] = (out[m[2]] ?? 0) + Number(m[1]);
+    return out;
+  };
+  const shift = async (actor, coins, sign) => {
+    const now = { ...Object.fromEntries(COINS.map((c) => [c, 0])), ...actor.system.currency };
+    for (const [c, n] of Object.entries(coins)) {
+      now[c] += sign * n;
+      if (now[c] < 0) throw new Error(`${actor.name} cannot pay ${n} ${c}`);
+    }
+    await actor.update({ system: { currency: now } });
+  };
+  const qty = (item) => Number(item.system?.quantity ?? 1);
+  const receive = async (actor, item, quantity) => {
+    const existing = [...actor.items].find((i) => i.name === item.name);
+    if (existing) return existing.update({ system: { quantity: qty(existing) + quantity } });
+    const data = item.toObject();
+    delete data._id;
+    data.system.quantity = quantity;
+    return actor.createItem(data);
+  };
+  const lose = async (actor, item, quantity) => {
+    const left = qty(item) - quantity;
+    if (left > 0) await item.update({ system: { quantity: left } });
+    else await item.delete();
+  };
+  const byId = (actor, ref) => (typeof ref === 'string' ? actor.items.get(ref) : actor.items.get(ref._id ?? ref.id));
+  const isMerchant = (actor) => actor.flags?.['item-piles']?.data?.type === 'merchant';
+  const price = (item) => {
+    const p = item.system?.price ?? {};
+    return { [p.denomination ?? 'gp']: Number(p.value) || 0 };
+  };
+  return {
+    calls: [],
+    async updateItemPile(actor, data) {
+      actor.flags['item-piles'] = { data: { ...(actor.flags['item-piles']?.data ?? {}), ...data } };
+    },
+    isItemPileMerchant: isMerchant,
+    async addCurrencies(actor, str) {
+      await shift(actor, parse(str), +1);
+    },
+    async removeCurrencies(actor, str) {
+      await shift(actor, parse(str), -1);
+    },
+    async transferCurrencies(from, to, str) {
+      await shift(from, parse(str), -1);
+      await shift(to, parse(str), +1);
+    },
+    async tradeItems(seller, buyer, items) {
+      for (const { item, quantity } of items) {
+        const cost = Object.fromEntries(Object.entries(price(item)).map(([c, n]) => [c, n * quantity * (isMerchant(seller) ? 1 : 0.5)]));
+        if (!isMerchant(buyer)) await shift(buyer, cost, -1);
+        if (!isMerchant(seller)) await shift(seller, cost, +1);
+        await receive(buyer, item, quantity);
+        await lose(seller, item, quantity);
+      }
+    },
+    async transferItems(from, to, items) {
+      for (const ref of items) {
+        const item = byId(from, ref);
+        await receive(to, item, ref.quantity ?? qty(item));
+        await lose(from, item, ref.quantity ?? qty(item));
+      }
+    },
+    async transferAllItems(from, to) {
+      for (const item of [...from.items]) {
+        await receive(to, item, qty(item));
+        await item.delete();
+      }
+    },
+    async removeItems(actor, items) {
+      for (const ref of items) {
+        const item = byId(actor, ref);
+        if (item) await lose(actor, item, ref.quantity ?? qty(item));
+      }
+    }
+  };
 }

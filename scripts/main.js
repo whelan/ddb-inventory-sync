@@ -31,6 +31,7 @@ import { invertMapping, resolveTarget } from './core/targets.js';
 import { ProxyClient } from './core/client.js';
 import { linkRows, looksLikeImport } from './core/linker.js';
 import { runDiagnostics, runSelfTest, renderReport } from './core/selftest.js';
+import { runScenarios } from './core/scenarios.js';
 import { registerSettings, setting, foreignSetting } from './settings.js';
 
 const LOG_SIZE = 300;
@@ -342,6 +343,23 @@ const api = {
     return report;
   },
 
+  /**
+   * Play Item Piles scenarios on a synced test character and check D&D Beyond
+   * after each step. Returns plain JSON (for foundry-mcp-bridge run_macro).
+   * args: { actor, otherActor, live, only, keep, configure: { proxyUrl, enabled, dryRun, currencyMode } }
+   */
+  async runScenarios(args = {}) {
+    if (!game.user.isGM) return { ok: false, steps: [{ name: 'Preflight', status: 'fail', detail: 'GM only' }] };
+    if (args.configure) {
+      for (const key of ['proxyUrl', 'enabled', 'dryRun', 'currencyMode', 'verifyWrites']) {
+        if (args.configure[key] !== undefined) await game.settings.set(MODULE_ID, key, args.configure[key]);
+      }
+    }
+    const report = await runScenarios(args, scenarioDeps());
+    if (args.chat !== false) await postReport(`DDB Inventory Sync — scenarios (${report.mode})`, report.steps);
+    return report;
+  },
+
   /** Check the proxy route and the cobalt for one actor without writing anything. */
   async test(actor) {
     const target = targetFor(actor);
@@ -385,6 +403,86 @@ const api = {
     await item.update({ [`flags.${MODULE_ID}.definition`]: { id, entityTypeId } }, { [SKIP_OPTION]: { skip: true } });
   }
 };
+
+const TEST_MACRO = 'DDB Inventory Sync: Test';
+const TEST_MACRO_BODY = `// Plays merchant, loot, give, party and coin scenarios through Item Piles on a
+// synced test character and checks D&D Beyond after each step (see TESTING.md).
+// From a local Claude: foundry-mcp-bridge run_macro { name: "${TEST_MACRO}", args: { actor: "<name>" } }
+// Args: actor, otherActor, live (needed against a real proxy), only: ["buy","sell","loot","use","playerEdit","give","party"], keep, configure: { proxyUrl, enabled, dryRun, currencyMode }
+return await game.modules.get('ddb-inventory-sync').api.runScenarios(scope ?? {});
+`;
+
+const proxyBase = () => (setting('proxyUrl') || foreignSetting('ddb-sync', 'proxyUrl') || '').replace(/\/+$/, '');
+async function mockCall(path, body) {
+  const r = await fetch(`${proxyBase()}${path}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  if (!r.ok) throw new Error(`mock ${path} answered ${r.status}`);
+  return r.json();
+}
+
+/** Wait until the batch window has passed and the queue is empty. */
+async function settle() {
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, BATCH_MS + 100));
+    await queue.idle();
+    if (!batches.size && !queue.size) return;
+  }
+}
+
+function scenarioDeps() {
+  const readDdb = async (characterId) => {
+    const json = await client.read(characterId);
+    if (!json?.success) throw new Error(`D&D Beyond read failed: ${json?.message ?? json?.ddbStatus ?? '?'}`);
+    return json.data;
+  };
+  return {
+    settings: () => ({ enabled: setting('enabled'), dryRun: setting('dryRun'), currencyMode: setting('currencyMode') }),
+    isActiveGM,
+    paused: () => paused,
+    isMock: async () => {
+      try {
+        const r = await fetch(`${proxyBase()}/mock/state`);
+        return r.ok && Array.isArray((await r.json())?.characters);
+      } catch {
+        return false;
+      }
+    },
+    findActor: (name) => game.actors.getName?.(name) ?? game.actors.get(name) ?? null,
+    syncedCharacters: () => game.actors.filter((a) => targetFor(a)?.kind === 'character'),
+    targetFor,
+    partyActor: () => (partyConfig().actorId ? game.actors.get(partyConfig().actorId) ?? null : null),
+    itemPiles: () => (game.modules.get('item-piles')?.active ? game.itempiles?.API ?? null : null),
+    readDdb,
+    settle,
+    rowIdOf: (item) => ids.get(item.uuid)?.ddbId ?? null,
+    quantityOf: (item) => quantityOf(item),
+    failed: () => queue.failed,
+    createActor: (data) => Actor.create(data),
+    deleteActor: (actor) => actor.delete(),
+    createItems: (actor, items) => actor.createEmbeddedDocuments('Item', items),
+    updateItem: (item, changes) => item.update(changes),
+    deleteItem: (item) => item.delete(),
+    itemData: (item) => item.toObject(),
+    setCoins: (actor, coins) => actor.update({ system: { currency: coins } }),
+    mockEdit: (body) => mockCall('/mock/edit', body),
+    mockParty: async () => {
+      const state = await mockCall('/mock/state');
+      return state.party?.[String(partyConfig().campaignId)] ?? { inventory: [], currencies: {} };
+    },
+    log,
+    recentLog: () => syncLog.slice(-60).map((e) => `${e.level} ${e.message}`)
+  };
+}
+
+async function ensureTestMacro() {
+  if (!game.user.isGM || !setting('provideTestMacro')) return;
+  const existing = game.macros.find((m) => m.name === TEST_MACRO);
+  if (existing) {
+    if (existing.command !== TEST_MACRO_BODY) await existing.update({ command: TEST_MACRO_BODY });
+    return;
+  }
+  await Macro.create({ name: TEST_MACRO, type: 'script', command: TEST_MACRO_BODY, img: 'icons/svg/dice-target.svg' });
+  log('info', `Created the macro "${TEST_MACRO}"`);
+}
 
 function diagnosticsContext() {
   const mapping = actorToDdb();
@@ -454,6 +552,7 @@ Hooks.once('ready', () => {
   game.modules.get(MODULE_ID).api = api;
   for (const actor of game.actors) snapshotActor(actor);
   registerHooks();
+  ensureTestMacro().catch((err) => log('warn', `Could not create the test macro: ${err.message}`));
   if (game.user.isGM && diagnosticsContext().modules.ddbImporterDynamicSync) {
     ui.notifications.warn('DDB Inventory Sync: DDB Importer dynamic sync is on as well — inventory changes would be sent twice.');
   }
