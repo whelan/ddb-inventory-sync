@@ -11,10 +11,18 @@ export function installFoundry() {
   const chat = [];
   const notes = [];
 
+  let hookId = 0;
   const Hooks = {
-    on: (name, fn) => hooks.set(name, [...(hooks.get(name) ?? []), fn]),
-    once: (name, fn) => hooks.set(name, [...(hooks.get(name) ?? []), fn]),
-    call: (name, ...args) => (hooks.get(name) ?? []).forEach((fn) => fn(...args))
+    // Like Foundry: on() returns an id, off() takes the id or the function.
+    on: (name, fn) => {
+      const id = ++hookId;
+      hooks.set(name, [...(hooks.get(name) ?? []), { id, fn }]);
+      return id;
+    },
+    once: (name, fn) => Hooks.on(name, fn),
+    off: (name, ref) => hooks.set(name, (hooks.get(name) ?? []).filter((h) => h.id !== ref && h.fn !== ref)),
+    call: (name, ...args) => (hooks.get(name) ?? []).forEach((h) => h.fn(...args)),
+    count: (name) => (hooks.get(name) ?? []).length
   };
 
   const setPath = (obj, path, value) => {

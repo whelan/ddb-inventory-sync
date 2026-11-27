@@ -15,4 +15,5 @@ jobs:
           node-version: 22
       - name: Validate module.json
         run: node -e "const m=require('./module.json'); for (const k of ['id','title','version','esmodules','compatibility']) if(!m[k]) throw new Error('module.json is missing '+k)"
+      - run: npm ci
       - run: npm test

@@ -10,6 +10,8 @@ Three levels, from no risk to a real character. Do them in order.
 | 3. Live self-test + table check | D&D Beyond accepts the calls the way we assume | A **test** character | 15 min |
 
 Every edge case and the test that covers it: [docs/EDGE-CASES.md](docs/EDGE-CASES.md).
+The full plan for a local Claude (local Foundry → D&D Beyond campaign A → The Forge with campaign B,
+hot reload, no manual reloads): [docs/TEST-PLAN.md](docs/TEST-PLAN.md).
 
 ---
 

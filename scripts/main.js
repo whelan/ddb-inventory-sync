@@ -1,537 +1,58 @@
 /**
- * DDB Inventory Sync — Foundry glue.
+ * DDB Inventory Sync — bootstrap.
  *
- * Listens to core document hooks rather than Item Piles' own hooks: a
- * merchant purchase, a loot pile "take", a trade and a GM drag all end as
- * createItem / updateItem / deleteItem / updateActor on the receiving actor,
- * so one listener covers Item Piles, other merchant sheets and manual edits.
- * Only the active GM client acts, so each change is sent once.
+ * Kept deliberately small and stable: it registers the settings and menus on
+ * init and loads the runtime on ready. Everything else lives in runtime.js,
+ * which can be swapped while Foundry keeps running:
  *
- * The GM client keeps a snapshot of every synced item's quantity and every
- * synced actor's coins, so it knows the delta of a change even when a player
- * client made it (preUpdate hooks run only on the client that changes).
+ *  - normally the runtime is ./runtime.js;
+ *  - with the client setting "Dev runtime URL" (e.g. http://localhost:3997/runtime.js
+ *    from `npm run dev`) it is loaded from the local dev server instead, and
+ *    `reload` fetches a fresh build and replaces the running runtime in place —
+ *    in a local world and on The Forge alike.
+ *
+ * The world macro "DDB Inventory Sync: Dev" exposes this to a local Claude
+ * through foundry-mcp-bridge's run_macro (status, reload, reloadPage,
+ * configure, diagnose, log, failed, retryFailed).
  */
-import { MODULE_ID, SKIP_OPTION } from './core/constants.js';
-import { buildIndex, matchDefinition } from './core/matcher.js';
-import {
-  coalesceKey,
-  mergeOps,
-  isForeignCurrencyUpdate,
-  isForeignItemUpdate,
-  isPhysical,
-  planCreate,
-  planCurrency,
-  planDelete,
-  planUpdate,
-  quantityOf
-} from './core/planner.js';
-import { SyncQueue } from './core/queue.js';
-import { SyncEngine } from './core/engine.js';
-import { invertMapping, resolveTarget } from './core/targets.js';
-import { ProxyClient } from './core/client.js';
-import { linkRows, looksLikeImport } from './core/linker.js';
-import { runDiagnostics, runSelfTest, renderReport } from './core/selftest.js';
-import { runScenarios } from './core/scenarios.js';
-import { registerSettings, setting, foreignSetting } from './settings.js';
+import { MODULE_ID } from './core/constants.js';
+import { registerSettings, setting } from './settings.js';
 
-const LOG_SIZE = 300;
-const BATCH_MS = 300;
-const syncLog = [];
-
-function log(level, message, op) {
-  const entry = { at: new Date().toISOString(), level, message, characterId: op?.characterId ?? null };
-  syncLog.push(entry);
-  if (syncLog.length > LOG_SIZE) syncLog.shift();
-  if (level === 'debug' && !setting('debug')) return;
-  (console[level] ?? console.log)(`${MODULE_ID} | ${message}`);
-}
-
-let paused = false;
-const isActiveGM = () => !!game.users.activeGM?.isSelf;
-const enabled = () => setting('enabled') && isActiveGM() && !paused;
-const skipped = (options) => !!options?.[SKIP_OPTION]?.skip;
-
-function partyConfig() {
-  return {
-    actorId: setting('partyActorId') || null,
-    campaignId: setting('partyCampaignId') || foreignSetting('ddb-sync', 'campaignId') || null,
-    carrierCharacterId: setting('partyCarrierCharacterId') || null
-  };
-}
-
-function actorToDdb() {
-  return invertMapping(foreignSetting('ddb-sync', 'characterMapping'));
-}
-
-function targetFor(actor) {
-  if (!actor || actor.documentName !== 'Actor') return null;
-  // An unlinked token's synthetic actor shares its base actor's id; its items are not the PC's.
-  if (actor.isToken && !actor.token?.actorLink) return null;
-  return resolveTarget(actor.toObject(false), { moduleId: MODULE_ID, actorToDdb: actorToDdb(), party: partyConfig() });
-}
-
-function cobaltFor(characterId) {
-  return (
-    setting('characterCobalts')?.[String(characterId)] ||
-    setting('cobalt') ||
-    foreignSetting('ddb-sync', 'cobaltCookie') ||
-    ''
-  );
-}
-
-const client = new ProxyClient({
-  proxyUrl: () => setting('proxyUrl') || foreignSetting('ddb-sync', 'proxyUrl') || '',
-  cobaltFor
-});
-
-// --- Row ids: Foundry item uuid -> D&D Beyond inventory row ---------------------
-const memory = new Map(); // uuid -> { ddbId } | null (null: known to have no row yet)
-const storedId = (item) => item?.getFlag?.(MODULE_ID, 'ddbId') ?? item?.flags?.ddbimporter?.id ?? null;
-const ids = {
-  get(uuid) {
-    if (memory.has(uuid)) return memory.get(uuid);
-    const ddbId = storedId(fromUuidSync(uuid));
-    return ddbId ? { ddbId } : null;
-  },
-  async set(uuid, ddbId) {
-    memory.set(uuid, { ddbId });
-    const item = fromUuidSync(uuid);
-    if (item) await item.update({ [`flags.${MODULE_ID}.ddbId`]: ddbId }, { [SKIP_OPTION]: { skip: true } });
-  },
-  forget(uuid) {
-    memory.set(uuid, null);
-  },
-  release(uuid) {
-    memory.delete(uuid);
-  },
-  knownMissing(uuid) {
-    return memory.has(uuid) && memory.get(uuid) === null;
-  },
-  /** Is this row already owned by another item synced to the same character? */
-  isClaimed(ddbId, op) {
-    for (const [uuid, ref] of memory) if (uuid !== op.itemId && ref?.ddbId === ddbId) return true;
-    for (const actor of game.actors) {
-      if (targetFor(actor)?.characterId !== op.characterId) continue;
-      for (const item of actor.items) if (item.uuid !== op.itemId && !memory.has(item.uuid) && storedId(item) === ddbId) return true;
-    }
-    return false;
-  }
-};
-
-// --- Item definitions (name -> D&D Beyond definition), loaded once per session ---
-let indexPromise = null;
-function definitionIndex(characterId) {
-  indexPromise ??= client.items(characterId, partyConfig().campaignId).then((defs) => {
-    if (!defs.length) throw new Error('D&D Beyond returned no item definitions (proxy, cobalt or campaign?)');
-    log('info', `Loaded ${defs.length} D&D Beyond item definitions`);
-    return buildIndex(defs);
-  });
-  // A failure is not cached: the next add tries again instead of turning everything into custom items.
-  indexPromise.catch(() => (indexPromise = null));
-  return indexPromise;
-}
-
-/** Items created this session whose add has not been planned yet. */
-const pendingCreates = new Set();
-
-/** Plan an add from the item as it is now (used when the queue reaches it). */
-async function planAddFor(uuid) {
-  pendingCreates.delete(uuid);
-  const item = fromUuidSync(uuid);
-  if (!item) return null; // gone before its turn
-  const target = targetFor(item.parent);
-  if (!target) return null;
-  const itemData = item.toObject(false);
-  let definition = matchDefinition(itemData, null, MODULE_ID);
-  if (!definition) definition = matchDefinition(itemData, await definitionIndex(target.characterId), MODULE_ID);
-  const { op, reason, unmatched } = planCreate(itemData, target, { definition, unmatched: setting('unmatched') });
-  if (!op) {
-    log(unmatched ? 'warn' : 'debug', `${item.name}: ${reason}`);
-    if (unmatched && setting('notifyFailures')) ui.notifications.warn(`D&D Beyond sync: ${reason} — not sent`);
-    return null;
-  }
-  return { ...op, itemId: uuid };
-}
-
-const engine = new SyncEngine({
-  client,
-  ids,
-  planAddFor,
-  log,
-  dryRun: () => setting('dryRun'),
-  mode: () => setting('currencyMode'),
-  verify: () => setting('verifyWrites')
-});
-const queue = new SyncQueue((op) => engine.run(op), {
-  coalesceKey,
-  merge: mergeOps,
-  onError(op, err) {
-    log('error', `${op.kind} ${op.name ?? ''} failed: ${err.message}`, op);
-    if (setting('notifyFailures')) {
-      ui.notifications.error(`D&D Beyond sync: ${op.kind} ${op.name ?? ''} failed — ${err.message}. Retry with the module API (retryFailed).`);
-    }
-  }
-});
-
-// --- Snapshots: quantities and coins as the GM client last saw them -------------
-const quantities = new Map(); // item uuid -> quantity
-const purses = new Map(); // actor uuid -> currency
-function snapshotActor(actor) {
-  if (!targetFor(actor)) return;
-  purses.set(actor.uuid, { ...(actor.system?.currency ?? {}) });
-  for (const item of actor.items) if (isPhysical(item)) quantities.set(item.uuid, quantityOf(item));
-}
-
-// --- Batching: tells a character import (DDB Importer) apart from loot ----------
-const batches = new Map(); // `${kind}:${actorUuid}` -> { entries, timer }
-function batch(kind, actor, data, send, onSkip = () => {}) {
-  const key = `${kind}:${actor.uuid}`;
-  let b = batches.get(key);
-  if (!b) batches.set(key, (b = { entries: [], timer: null }));
-  b.entries.push({ data, send, onSkip }); // each entry keeps its own callbacks
-  clearTimeout(b.timer);
-  b.timer = setTimeout(() => {
-    batches.delete(key);
-    if (looksLikeImport(b.entries.map((e) => e.data), setting('importBurstLimit'))) {
-      log('warn', `Skipped ${b.entries.length} ${kind === 'create' ? 'new' : 'removed'} items on ${actor.name}: looks like a character import`);
-      for (const e of b.entries) e.onSkip();
-      return;
-    }
-    for (const e of b.entries) e.send();
-  }, BATCH_MS);
-}
-
-function registerHooks() {
-  Hooks.on('createItem', (item, options) => {
-    if (!isPhysical(item) || !targetFor(item.parent)) return;
-    quantities.set(item.uuid, quantityOf(item));
-    if (!enabled() || skipped(options)) return;
-    const target = targetFor(item.parent);
-    // A copy made by a transfer carries the source's row id; it gets its own row.
-    memory.set(item.uuid, null);
-    pendingCreates.add(item.uuid);
-    batch(
-      'create',
-      item.parent,
-      item.toObject(false),
-      () => queue.push({ kind: 'planAdd', itemId: item.uuid, name: item.name, characterId: target.characterId, scope: target.kind }),
-      () => {
-        // An imported item already has its D&D Beyond row: keep the id it carries.
-        pendingCreates.delete(item.uuid);
-        memory.delete(item.uuid);
-      }
-    );
-  });
-
-  Hooks.on('updateItem', (item, changes, options) => {
-    if (!isPhysical(item)) return;
-    const target = targetFor(item.parent);
-    if (!target) return;
-    const previousQuantity = quantities.has(item.uuid) ? quantities.get(item.uuid) : null;
-    quantities.set(item.uuid, quantityOf(item));
-    if (!enabled() || skipped(options)) return;
-    if (isForeignItemUpdate(changes)) {
-      log('debug', `${item.name}: update with non-inventory fields (an import?) not sent`);
-      return;
-    }
-    // Its add is still waiting and will send the stack as it is then.
-    if (pendingCreates.has(item.uuid)) return;
-    const ops = planUpdate(item.toObject(false), changes, target, {
-      syncEquipped: setting('syncEquipped'),
-      previousQuantity,
-      moduleId: MODULE_ID
-    });
-    for (const op of ops) queue.push({ ...op, itemId: item.uuid });
-  });
-
-  Hooks.on('deleteItem', (item, options) => {
-    if (!isPhysical(item)) return;
-    const target = targetFor(item.parent);
-    if (!target) return;
-    const previousQuantity = quantities.get(item.uuid);
-    quantities.delete(item.uuid);
-    if (pendingCreates.delete(item.uuid)) return; // created and removed before its add was sent
-    if (!enabled() || skipped(options)) return;
-    const op = planDelete(item.toObject(false), target, { moduleId: MODULE_ID });
-    if (!op) return;
-    if (previousQuantity) op.quantity = previousQuantity;
-    // Resolve the row now: the item is gone by the time the queue reaches it.
-    if (!memory.has(item.uuid)) {
-      const ddbId = storedId(item);
-      memory.set(item.uuid, ddbId ? { ddbId } : null);
-    }
-    const data = item.toObject(false);
-    batch('delete', item.parent, data, () => queue.push({ ...op, itemId: item.uuid }));
-  });
-
-  Hooks.on('updateActor', (actor, changes, options) => {
-    const target = targetFor(actor);
-    if (!target) return;
-    const previous = purses.get(actor.uuid) ?? null;
-    purses.set(actor.uuid, { ...(actor.system?.currency ?? {}) });
-    if (!enabled() || skipped(options) || !setting('syncCurrency')) return;
-    if (isForeignCurrencyUpdate(changes)) {
-      if (foundry.utils.hasProperty(changes, 'system.currency')) log('debug', `${actor.name}: coins changed with other data (an import?) not sent`);
-      return;
-    }
-    const op = planCurrency(actor.system?.currency, changes, target, previous);
-    if (op) queue.push(op);
-  });
-
-  // Snapshot actors that appear mid-session (a new PC, the party actor).
-  Hooks.on('createActor', (actor) => snapshotActor(actor));
-}
-
-// --- Public API: game.modules.get('ddb-inventory-sync').api --------------------
-const api = {
-  get log() {
-    return [...syncLog];
-  },
-  get failed() {
-    return [...queue.failed];
-  },
-  get pending() {
-    return queue.size;
-  },
-  get paused() {
-    return paused;
-  },
-  idle: () => queue.idle(),
-  targetFor: (actor) => targetFor(actor),
-
-  /** Stop sending (e.g. while re-importing characters with DDB Importer). Snapshots keep updating. */
-  pause() {
-    paused = true;
-    log('info', 'Paused');
-  },
-  resume() {
-    paused = false;
-    log('info', 'Resumed');
-  },
-  retryFailed() {
-    const n = queue.retryFailed();
-    log('info', `Retrying ${n} failed operations`);
-    return n;
-  },
-  reloadItems() {
-    indexPromise = null;
-  },
-
-  /** Check settings, proxy, cookies, mappings and the party — writes nothing. */
-  async diagnose({ chat = true } = {}) {
-    const report = await runDiagnostics(diagnosticsContext());
-    if (chat) await postReport('DDB Inventory Sync — diagnostics', report);
-    return report;
-  },
-
-  /**
-   * Live round trip on a TEST character: add, change, remove an item, move a
-   * coin and back, custom item, party. Cleans up after itself. Ignores dry run.
-   */
-  async selfTest(actor, { party = true, chat = true } = {}) {
-    const target = targetFor(actor);
-    if (!target || target.kind !== 'character') throw new Error(`${actor?.name ?? 'That actor'} is not a synced character`);
-    const index = await definitionIndex(target.characterId);
-    const report = await runSelfTest({
-      client,
-      characterId: target.characterId,
-      party: party ? partyConfig() : null,
-      index,
-      log
-    });
-    if (chat) await postReport(`DDB Inventory Sync — self-test on ${actor.name}`, report);
-    return report;
-  },
-
-  /**
-   * Play Item Piles scenarios on a synced test character and check D&D Beyond
-   * after each step. Returns plain JSON (for foundry-mcp-bridge run_macro).
-   * args: { actor, otherActor, live, only, keep, configure: { proxyUrl, enabled, dryRun, currencyMode } }
-   */
-  async runScenarios(args = {}) {
-    if (!game.user.isGM) return { ok: false, steps: [{ name: 'Preflight', status: 'fail', detail: 'GM only' }] };
-    if (args.configure) {
-      for (const key of ['proxyUrl', 'enabled', 'dryRun', 'currencyMode', 'verifyWrites']) {
-        if (args.configure[key] !== undefined) await game.settings.set(MODULE_ID, key, args.configure[key]);
-      }
-    }
-    const report = await runScenarios(args, scenarioDeps());
-    if (args.chat !== false) await postReport(`DDB Inventory Sync — scenarios (${report.mode})`, report.steps);
-    return report;
-  },
-
-  /** Check the proxy route and the cobalt for one actor without writing anything. */
-  async test(actor) {
-    const target = targetFor(actor);
-    if (!target) return { ok: false, message: `${actor?.name} is not synced to a D&D Beyond character` };
-    const json = await client.read(target.characterId);
-    if (!json?.success) return { ok: false, message: json?.message ?? 'read failed' };
-    return { ok: true, character: json.data.name, campaignId: json.data.campaignId, rows: json.data.inventory.length, currencies: json.data.currencies };
-  },
-
-  /** Pair this actor's existing items with its D&D Beyond inventory rows. */
-  async link(actor) {
-    const target = targetFor(actor);
-    if (!target || target.kind !== 'character') throw new Error(`${actor?.name} is not a synced character`);
-    const json = await client.read(target.characterId);
-    if (!json?.success) throw new Error(json?.message ?? 'read failed');
-    const items = actor.items
-      .filter((i) => isPhysical(i))
-      .map((i) => ({
-        uuid: i.uuid,
-        name: i.name,
-        quantity: quantityOf(i),
-        ddbId: storedId(i),
-        definitionId: i.flags?.ddbimporter?.definitionId ?? i.getFlag(MODULE_ID, 'definition')?.id ?? null
-      }));
-    const result = linkRows(items, json.data.inventory);
-    for (const { uuid, ddbId } of result.links) await ids.set(uuid, ddbId);
-    log('info', `Linked ${result.links.length} items on ${actor.name}; ${result.unmatchedItems.length} Foundry-only, ${result.unmatchedRows.length} DDB-only`);
-    return result;
-  },
-
-  /** Store a player's own cobalt cookie in this (GM) browser for writes to their character. */
-  async setCharacterCobalt(characterId, cobalt) {
-    const map = { ...setting('characterCobalts') };
-    if (cobalt) map[String(characterId)] = cobalt;
-    else delete map[String(characterId)];
-    await game.settings.set(MODULE_ID, 'characterCobalts', map);
-  },
-
-  /** Pin a Foundry item to a D&D Beyond definition (e.g. a vault homebrew item). */
-  async setDefinition(item, id, entityTypeId) {
-    await item.update({ [`flags.${MODULE_ID}.definition`]: { id, entityTypeId } }, { [SKIP_OPTION]: { skip: true } });
-  }
-};
-
-const TEST_MACRO = 'DDB Inventory Sync: Test';
-const TEST_MACRO_BODY = `// Plays merchant, loot, give, party and coin scenarios through Item Piles on a
-// synced test character and checks D&D Beyond after each step (see TESTING.md).
-// From a local Claude: foundry-mcp-bridge run_macro { name: "${TEST_MACRO}", args: { actor: "<name>" } }
-// Args: actor, otherActor, live (needed against a real proxy), only: ["buy","sell","loot","use","playerEdit","give","party"], keep, configure: { proxyUrl, enabled, dryRun, currencyMode }
-return await game.modules.get('ddb-inventory-sync').api.runScenarios(scope ?? {});
+const DEV_MACRO = 'DDB Inventory Sync: Dev';
+const DEV_MACRO_BODY = `// Dev control for DDB Inventory Sync, for a local Claude via foundry-mcp-bridge run_macro.
+// args: { action: "status" | "reload" | "reloadPage" | "configure" | "diagnose" | "selfTest" | "scenarios" | "log" | "failed" | "retryFailed", ... }
+// selfTest: { actor, party }   scenarios: same args as the "DDB Inventory Sync: Test" macro
+// configure: { module: { proxyUrl, enabled, dryRun, currencyMode, verifyWrites, partyActorId, partyCampaignId, partyCarrierCharacterId, devRuntimeUrl },
+//              ddbSync: { proxyUrl, campaignId, mapping: { "<ddbCharacterId>": "<actor name or id>" } } }
+// module.cobalt accepts only "MOCK" (for the mock) or "" — real cookies are entered by Lars.
+return await game.modules.get('ddb-inventory-sync').dev(scope ?? {});
 `;
 
-const proxyBase = () => (setting('proxyUrl') || foreignSetting('ddb-sync', 'proxyUrl') || '').replace(/\/+$/, '');
-async function mockCall(path, body) {
-  const r = await fetch(`${proxyBase()}${path}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
-  if (!r.ok) throw new Error(`mock ${path} answered ${r.status}`);
-  return r.json();
-}
+let current = null; // { api, stop }
+let loaded = null; // { source, at, url }
+let readyResolve;
+/** Resolves once the first runtime is running (tests await it). */
+export const ready = new Promise((r) => (readyResolve = r));
 
-/** Wait until the batch window has passed and the queue is empty. */
-async function settle() {
-  for (let i = 0; i < 20; i++) {
-    await new Promise((r) => setTimeout(r, BATCH_MS + 100));
-    await queue.idle();
-    if (!batches.size && !queue.size) return;
-  }
-}
-
-function scenarioDeps() {
-  const readDdb = async (characterId) => {
-    const json = await client.read(characterId);
-    if (!json?.success) throw new Error(`D&D Beyond read failed: ${json?.message ?? json?.ddbStatus ?? '?'}`);
-    return json.data;
-  };
-  return {
-    settings: () => ({ enabled: setting('enabled'), dryRun: setting('dryRun'), currencyMode: setting('currencyMode') }),
-    isActiveGM,
-    paused: () => paused,
-    isMock: async () => {
-      try {
-        const r = await fetch(`${proxyBase()}/mock/state`);
-        return r.ok && Array.isArray((await r.json())?.characters);
-      } catch {
-        return false;
-      }
-    },
-    findActor: (name) => game.actors.getName?.(name) ?? game.actors.get(name) ?? null,
-    syncedCharacters: () => game.actors.filter((a) => targetFor(a)?.kind === 'character'),
-    targetFor,
-    partyActor: () => (partyConfig().actorId ? game.actors.get(partyConfig().actorId) ?? null : null),
-    itemPiles: () => (game.modules.get('item-piles')?.active ? game.itempiles?.API ?? null : null),
-    readDdb,
-    settle,
-    rowIdOf: (item) => ids.get(item.uuid)?.ddbId ?? null,
-    quantityOf: (item) => quantityOf(item),
-    failed: () => queue.failed,
-    createActor: (data) => Actor.create(data),
-    deleteActor: (actor) => actor.delete(),
-    createItems: (actor, items) => actor.createEmbeddedDocuments('Item', items),
-    updateItem: (item, changes) => item.update(changes),
-    deleteItem: (item) => item.delete(),
-    itemData: (item) => item.toObject(),
-    setCoins: (actor, coins) => actor.update({ system: { currency: coins } }),
-    mockEdit: (body) => mockCall('/mock/edit', body),
-    mockParty: async () => {
-      const state = await mockCall('/mock/state');
-      return state.party?.[String(partyConfig().campaignId)] ?? { inventory: [], currencies: {} };
-    },
-    log,
-    recentLog: () => syncLog.slice(-60).map((e) => `${e.level} ${e.message}`)
-  };
-}
-
-async function ensureTestMacro() {
-  if (!game.user.isGM || !setting('provideTestMacro')) return;
-  const existing = game.macros.find((m) => m.name === TEST_MACRO);
-  if (existing) {
-    if (existing.command !== TEST_MACRO_BODY) await existing.update({ command: TEST_MACRO_BODY });
-    return;
-  }
-  await Macro.create({ name: TEST_MACRO, type: 'script', command: TEST_MACRO_BODY, img: 'icons/svg/dice-target.svg' });
-  log('info', `Created the macro "${TEST_MACRO}"`);
-}
-
-function diagnosticsContext() {
-  const mapping = actorToDdb();
-  return {
-    settings: {
-      enabled: setting('enabled'),
-      dryRun: setting('dryRun'),
-      currencyMode: setting('currencyMode'),
-      verifyWrites: setting('verifyWrites'),
-      proxyUrl: setting('proxyUrl') || foreignSetting('ddb-sync', 'proxyUrl') || ''
-    },
-    isActiveGM: isActiveGM(),
-    paused,
-    modules: {
-      itemPiles: !!game.modules.get('item-piles')?.active,
-      ddbSync: !!game.modules.get('ddb-sync')?.active,
-      ddbImporterDynamicSync: !!(game.modules.get('ddb-importer')?.active && foreignSetting('ddb-importer', 'dynamic-sync'))
-    },
-    actors: game.actors
-      .map((a) => ({ name: a.name, id: a.id, target: targetFor(a), hasCobalt: !!cobaltFor(targetFor(a)?.characterId) }))
-      .filter((a) => a.target),
-    mappedIds: [...mapping.entries()],
-    party: partyConfig(),
-    partyActorExists: !!(partyConfig().actorId && game.actors.get(partyConfig().actorId)),
-    client,
-    loadItems: (characterId) => client.items(characterId, partyConfig().campaignId)
-  };
-}
-
-async function postReport(title, report) {
-  await ChatMessage.create({
-    content: renderReport(title, report),
-    whisper: game.users.filter((u) => u.isGM).map((u) => u.id),
-    speaker: { alias: 'DDB Inventory Sync' }
-  });
-}
+const moduleEntry = () => game.modules.get(MODULE_ID);
 
 /** Settings-menu launchers (Foundry calls `new type().render(true)`). */
-export class DiagnosticsMenu {
+class DiagnosticsMenu {
   render() {
-    api.diagnose().catch((err) => ui.notifications.error(`Diagnostics failed: ${err.message}`));
+    moduleEntry()
+      .api?.diagnose()
+      .catch((err) => ui.notifications.error(`Diagnostics failed: ${err.message}`));
     ui.notifications.info('DDB Inventory Sync: diagnostics sent to chat (GM whisper).');
   }
 }
-export class SelfTestMenu {
+
+class SelfTestMenu {
   async render() {
-    const actors = game.actors.filter((a) => targetFor(a)?.kind === 'character');
+    const api = moduleEntry().api;
+    const actors = game.actors.filter((a) => api?.targetFor(a)?.kind === 'character');
     if (!actors.length) return ui.notifications.warn('No synced characters to test on.');
-    const options = actors.map((a) => `<option value="${a.id}">${foundry.utils.escapeHTML?.(a.name) ?? a.name}</option>`).join('');
+    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+    const options = actors.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
     const actorId = await foundry.applications.api.DialogV2.prompt({
       window: { title: 'D&D Beyond live self-test' },
       content: `<p>Writes to the chosen character on D&amp;D Beyond (a test item, one copper, a test custom item, and the party inventory) and removes it all again. Use a test character.</p>
@@ -544,17 +65,174 @@ export class SelfTestMenu {
   }
 }
 
+const MENUS = { DiagnosticsMenu, SelfTestMenu };
+
+async function importRuntime() {
+  const devUrl = setting('devRuntimeUrl');
+  if (devUrl) {
+    const url = `${devUrl}${devUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
+    return { mod: await import(url), source: 'dev', url: devUrl };
+  }
+  return { mod: await import('./runtime.js'), source: 'file', url: null };
+}
+
+async function load({ reloaded = false } = {}) {
+  // Import first: a build that does not load leaves the running runtime alone.
+  const { mod, source, url } = await importRuntime();
+  if (current) await current.stop();
+  current = await mod.start({ menus: MENUS, reloaded });
+  loaded = { source, url, at: new Date().toISOString(), build: mod.BUILD ?? null };
+  moduleEntry().api = current.api;
+  return loaded;
+}
+
+async function ensureDevMacro() {
+  if (!game.user.isGM || !setting('provideTestMacro')) return;
+  const existing = game.macros.find((m) => m.name === DEV_MACRO);
+  if (existing) {
+    if (existing.command !== DEV_MACRO_BODY) await existing.update({ command: DEV_MACRO_BODY });
+  } else {
+    await Macro.create({ name: DEV_MACRO, type: 'script', command: DEV_MACRO_BODY, img: 'icons/svg/gear.svg' });
+  }
+}
+
+const MODULE_SETTINGS = ['proxyUrl', 'enabled', 'dryRun', 'currencyMode', 'verifyWrites', 'partyActorId', 'partyCampaignId', 'partyCarrierCharacterId', 'unmatched', 'syncCurrency', 'syncEquipped', 'devRuntimeUrl', 'debug'];
+
+/** Apply settings for a test run. Cookies are never set this way: Lars enters them. */
+async function configure({ module = {}, ddbSync = {} } = {}) {
+  const changed = [];
+  for (const [key, value] of Object.entries(module)) {
+    if (key === 'cobalt') {
+      if (value !== 'MOCK' && value !== '') throw new Error('configure.module.cobalt: only "MOCK" or "" — real cookies are entered by Lars in the settings');
+      await game.settings.set(MODULE_ID, key, value);
+      changed.push(`${MODULE_ID}.cobalt`);
+      continue;
+    }
+    if (!MODULE_SETTINGS.includes(key)) throw new Error(`configure.module: "${key}" cannot be set here`);
+    await game.settings.set(MODULE_ID, key, value);
+    changed.push(`${MODULE_ID}.${key}`);
+  }
+  if (Object.keys(ddbSync).length && !game.modules.get('ddb-sync')?.active) throw new Error('configure.ddbSync: ddb-sync is not active');
+  for (const key of ['proxyUrl', 'campaignId']) {
+    if (ddbSync[key] === undefined) continue;
+    await game.settings.set('ddb-sync', key, ddbSync[key]);
+    changed.push(`ddb-sync.${key}`);
+  }
+  if (ddbSync.mapping) {
+    const mapping = { ...(game.settings.get('ddb-sync', 'characterMapping') ?? {}) };
+    for (const [ddbId, who] of Object.entries(ddbSync.mapping)) {
+      if (who === null) {
+        delete mapping[ddbId];
+        continue;
+      }
+      const actor = game.actors.get(who) ?? game.actors.getName(who);
+      if (!actor) throw new Error(`configure.ddbSync.mapping: no actor "${who}"`);
+      for (const [k, v] of Object.entries(mapping)) if (v === actor.id && k !== ddbId) delete mapping[k];
+      mapping[ddbId] = actor.id;
+    }
+    await game.settings.set('ddb-sync', 'characterMapping', mapping);
+    changed.push('ddb-sync.characterMapping');
+  }
+  return changed;
+}
+
+function status() {
+  const api = moduleEntry().api;
+  const get = (mod, key) => {
+    try {
+      return game.settings.get(mod, key);
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    version: moduleEntry().version ?? null,
+    runtime: loaded,
+    activeGM: !!game.users.activeGM?.isSelf,
+    foundry: game.version ?? null,
+    system: game.system ? `${game.system.id} ${game.system.version}` : null,
+    modules: Object.fromEntries(['item-piles', 'ddb-sync', 'ddb-importer'].map((id) => [id, game.modules.get(id)?.active ? game.modules.get(id).version ?? true : false])),
+    settings: Object.fromEntries(MODULE_SETTINGS.map((k) => [k, get(MODULE_ID, k)])),
+    ddbSync: {
+      proxyUrl: get('ddb-sync', 'proxyUrl') ?? null,
+      campaignId: get('ddb-sync', 'campaignId') ?? null,
+      mapping: get('ddb-sync', 'characterMapping') ?? null,
+      hasCobalt: !!get('ddb-sync', 'cobaltCookie')
+    },
+    hasOwnCobalt: !!get(MODULE_ID, 'cobalt'),
+    synced: game.actors
+      .map((a) => ({ name: a.name, id: a.id, target: api?.targetFor(a) ?? null }))
+      .filter((a) => a.target),
+    pending: api?.pending ?? null,
+    failed: api?.failed?.length ?? null,
+    paused: api?.paused ?? null
+  };
+}
+
+/** The Dev macro's entry point. Returns plain JSON. */
+async function dev(args = {}) {
+  if (!game.user.isGM) return { ok: false, error: 'GM only' };
+  const api = () => moduleEntry().api;
+  try {
+    switch (args.action ?? 'status') {
+      case 'status':
+        return { ok: true, ...status() };
+      case 'reload':
+        return { ok: true, reloaded: await load({ reloaded: true }), ...status() };
+      case 'reloadPage':
+        setTimeout(() => window.location.reload(), 500);
+        return { ok: true, reloading: true };
+      case 'configure': {
+        const changed = await configure(args);
+        if (args.module?.devRuntimeUrl !== undefined || args.reload) await load({ reloaded: true });
+        return { ok: true, changed, ...status() };
+      }
+      case 'diagnose':
+        return { ok: true, report: await api().diagnose({ chat: args.chat ?? false }) };
+      case 'selfTest': {
+        const actor = game.actors.get(args.actor) ?? game.actors.getName(args.actor);
+        if (!actor) return { ok: false, error: `no actor "${args.actor}"` };
+        const report = await api().selfTest(actor, { party: args.party ?? true, chat: args.chat ?? true });
+        return { ok: !report.some((r) => r.status === 'fail'), report };
+      }
+      case 'scenarios':
+        return await api().runScenarios({ ...args, action: undefined });
+      case 'log':
+        return { ok: true, log: api().log.slice(-(args.lines ?? 60)) };
+      case 'failed':
+        return { ok: true, failed: api().failed };
+      case 'retryFailed':
+        return { ok: true, retried: api().retryFailed() };
+      default:
+        return { ok: false, error: `unknown action "${args.action}"` };
+    }
+  } catch (err) {
+    return { ok: false, error: err.message, stack: String(err.stack ?? '').split('\n').slice(0, 6) };
+  }
+}
+
 Hooks.once('init', () => {
-  registerSettings({ DiagnosticsMenu, SelfTestMenu });
+  registerSettings(MENUS);
+  moduleEntry().dev = dev;
 });
 
-Hooks.once('ready', () => {
-  game.modules.get(MODULE_ID).api = api;
-  for (const actor of game.actors) snapshotActor(actor);
-  registerHooks();
-  ensureTestMacro().catch((err) => log('warn', `Could not create the test macro: ${err.message}`));
-  if (game.user.isGM && diagnosticsContext().modules.ddbImporterDynamicSync) {
-    ui.notifications.warn('DDB Inventory Sync: DDB Importer dynamic sync is on as well — inventory changes would be sent twice.');
+Hooks.once('ready', async () => {
+  try {
+    await load();
+  } catch (err) {
+    console.error(`${MODULE_ID} | runtime failed to load`, err);
+    if (setting('devRuntimeUrl')) {
+      ui.notifications.error(`DDB Inventory Sync: dev runtime failed to load (${err.message}). Is "npm run dev" running? Falling back to the installed code.`);
+      try {
+        const mod = await import('./runtime.js');
+        current = await mod.start({ menus: MENUS });
+        loaded = { source: 'file (dev fallback)', url: null, at: new Date().toISOString(), build: null };
+        moduleEntry().api = current.api;
+      } catch (inner) {
+        console.error(`${MODULE_ID} | installed runtime failed too`, inner);
+      }
+    }
   }
-  log('info', `Ready (${setting('enabled') ? (setting('dryRun') ? 'dry run' : 'live') : 'disabled'}, ${setting('currencyMode')} mode)`);
+  await ensureDevMacro().catch((err) => console.warn(`${MODULE_ID} | dev macro: ${err.message}`));
+  readyResolve();
 });

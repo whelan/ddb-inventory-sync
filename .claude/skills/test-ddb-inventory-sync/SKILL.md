@@ -1,101 +1,94 @@
 ---
 name: test-ddb-inventory-sync
-description: Test DDB Inventory Sync end to end in a running Foundry world from a local Claude — play Item Piles merchant, loot, give, party and coin scenarios through foundry-mcp-bridge's run_macro against the mock D&D Beyond (or, only when Lars says so, a live test character), read the JSON report, inject faults and re-run. Use for "test the DDB sync", "kør scenarierne", "tjek at Item Piles synker til DDB", "/test-ddb-inventory-sync".
+description: Run DDB Inventory Sync's test plan (docs/TEST-PLAN.md) from a local Claude — local Foundry against the mock, then a D&D Beyond test campaign, then The Forge with a second campaign — through foundry-mcp-bridge's run_macro, with hot reload so Foundry and the proxy never need a manual reload. Use for "kør testplanen", "test the DDB sync", "fase 1/2/3", "tjek at Item Piles synker til DDB", "/test-ddb-inventory-sync".
 ---
 
-# Test DDB Inventory Sync through Foundry
+# Run the DDB Inventory Sync test plan
 
-You drive the module's own scenario runner. It uses Item Piles' API (`tradeItems`,
-`transferItems`, `transferAllItems`, `addCurrencies`, `transferCurrencies`, `removeItems`) on a
-synced test character, waits for the sync, and after every step checks that D&D Beyond matches
-Foundry. It cleans up and returns a JSON report. You never write items to D&D Beyond yourself.
+`docs/TEST-PLAN.md` is the plan: phases, what Lars sets up, and the exit criteria. This skill is
+how you execute it. You drive two world macros through `mcp__foundry__run_macro` (both are
+created by the module on GM login):
 
-## Needs
+- **`DDB Inventory Sync: Dev`** — `args.action`:
+  - `status`: the runtime source and build, settings, mapping, synced actors, and pending/failed counts
+  - `configure` `{ module: {...}, ddbSync: { proxyUrl, campaignId, mapping: { "<ddbId>": "<actor name>"|null } } }`
+  - `reload`: hot-swaps the runtime from the dev server; a broken build is refused
+  - `reloadPage`: the last resort, for bootstrap changes
+  - `diagnose`, `selfTest` `{ actor, party }`, `scenarios` (same args as the Test macro)
+  - `log` `{ lines }`, `failed`, `retryFailed`
+- **`DDB Inventory Sync: Test`** — the Item Piles scenario runner (`actor`, `otherActor`,
+  `live`, `only`, `keep`, `configure`).
 
-- Foundry running with the GM logged in, and these modules active: DDB Inventory Sync, Item Piles, ddb-sync (for the
-  character mapping), and the foundry-mcp-bridge module (the `mcp__foundry__*` tools are present).
-- Lars has switched on **"Allow the bridge to run macros"** in the bridge module's settings. You
-  cannot do this yourself. If `run_macro` answers `UNSUPPORTED`, ask him to turn it on, and
-  remind him to turn it off afterwards.
-- The world macro **`DDB Inventory Sync: Test`**. The module creates it on GM login (setting *Provide
-  the test macro*). If `run_macro` answers `NOT_FOUND`, ask Lars to reload Foundry once.
+Every call returns JSON with `ok`. Use `timeoutMs: 300000` for scenarios (600000 when live).
 
-## 1. Against the mock (default — no risk)
+## Before anything
 
-1. Start the mock **on the machine whose browser runs Foundry**. The browser calls it, not
-   the bridge. Run it in the background from this repo:
-   `npm run mock` → `http://localhost:3999` (status page at `/`, state at `/mock/state`).
-2. Run every scenario and point the module at the mock in the same call:
-   ```
-   mcp__foundry__run_macro {
-     name: "DDB Inventory Sync: Test",
-     timeoutMs: 300000,
-     args: {
-       configure: { proxyUrl: "http://localhost:3999", enabled: true, dryRun: false },
-       actor: "<a synced PC>"            // optional against the mock
-     }
-   }
-   ```
-3. Read `result.ok` and `result.steps` (`{ name, status: ok|warn|fail|info, detail }`).
-   `result.log` holds the module's last log lines. The same report is whispered to the GM; read it
-   with `mcp__foundry__get_chat_log` if you lost the result.
-4. On a ❌, look at the mock: `curl -s localhost:3999/mock/state | jq '.calls[-15:]'` shows what
-   was sent and what came back. `docs/EDGE-CASES.md` lists the expected behaviour and the unit
-   test for each situation. If you change code, run `npm test` before you trust a fix.
+1. `mcp__foundry__get_world_info` works, which means the bridge is connected. If not: is Foundry open in Chrome as GM,
+   and is `RELAY_TOKEN` exported? Ask Lars.
+2. Dev `status`. `NOT_FOUND` means the module is not loaded or the macro is missing: ask Lars to reload once.
+   `UNSUPPORTED` means *Allow the bridge to run macros* is off: ask Lars.
+3. Background processes. Start them with `run_in_background` and check they are up:
+   - module dev server: `npm run dev` here, then `curl -s localhost:3997/status`
+   - mock (phase 1): `npm run mock`, then `curl -s localhost:3999/ping`
+   - real proxy (phases 2–3): `npm run dev` in `../ddb-proxy`, then `curl -s localhost:3000/ping`
+   Run `npm install` once in each repo first if `node_modules` is missing.
+4. Test actors: create them with `mcp__foundry__create_document` if missing. You need *Test Hero A*
+   and *Test Hero B* (`type: "character"`) and *Test Party* (`type: "group"`). Never use a player's actor.
 
-### Narrower runs and fault injection
+## The fix loop (no reloads)
 
-- `args.only`: any of `"buy"`, `"sell"`, `"loot"`, `"use"`, `"playerEdit"`, `"give"`, `"party"`.
-  The 250 gp pocket-money step always runs first.
-- `args.keep: true` leaves the fixtures (merchant, loot pile) and the items in place so you can inspect them.
-- `args.otherActor: "<name>"` picks the receiver for the give step.
-- Faults go to the mock, then you re-run:
-  ```bash
-  curl -s -XPOST localhost:3999/mock/fail   -d '{"status":503,"count":2}'   # transient: retried, steps should pass
-  curl -s -XPOST localhost:3999/mock/fail   -d '{"status":400,"count":1,"op":"add"}'  # rejected: a step should fail
-  curl -s -XPOST localhost:3999/mock/config -d '{"dropRowIds":true}'        # add without row ids: should still pass
-  curl -s -XPOST localhost:3999/mock/config -d '{"currencyIsDelta":true}'   # wrong coin semantics: coin steps must fail
-  curl -s -XPOST localhost:3999/mock/config -d '{"latencyMs":1500}'         # slow D&D Beyond
-  curl -s -XPOST localhost:3999/mock/reset
-  ```
-  Reset `/mock/config` afterwards (`{"dropRowIds":false,"currencyIsDelta":false,"latencyMs":0}`).
-- `configure.currencyMode: "absolute"` runs the scenarios in absolute mode. In that mode the
-  *Player edits* step reports `info` rather than `ok`, which is expected.
+1. A step fails. Read its `detail`, Dev `log`, Dev `failed`, and on the mock
+   `curl -s localhost:3999/mock/state | jq '.calls[-15:]'`.
+2. Find the cause in the code. Check `docs/EDGE-CASES.md` for the intended behaviour, and add or adjust a test in
+   `tests/` that reproduces it. `npm test` must fail before the fix and pass after.
+3. Save. The dev server rebuilds. Wait for the build:
+   `curl -s "localhost:3997/wait?after=<build from /status>"` and confirm `ok: true`.
+4. Dev `reload`, then check `status.runtime.build` equals the new build.
+5. Re-run the failing step, then the whole phase.
+6. Proxy fixes: edit `../ddb-proxy`, and `node --watch` restarts it by itself. Run its `npm test`.
+7. Commit on the branch with a clear message once green. Never push without Lars's say-so.
 
-### Other read-only checks
+Changes to `scripts/main.js` (the bootstrap) or `scripts/settings.js` need Dev `reloadPage`, or
+for new settings a `reload` re-registers them. `module.json` changes need Lars to restart Foundry.
 
-- *Diagnostics* has no macro of its own. Lars clicks **Run diagnostics** in the module
-  settings, and you read the whisper with `get_chat_log`.
+## Phase 1 — mock (you run it alone)
 
-## 2. Live, on a D&D Beyond test character (only when Lars asks)
-
-This writes to a real character on D&D Beyond (and removes it all again). Never use a player's
-character. Always name the actor explicitly.
-
+The configure call and the eight checks are in TEST-PLAN.md § Phase 1. Mock fault knobs:
+```bash
+curl -s -XPOST localhost:3999/mock/fail   -d '{"status":503,"count":2}'
+curl -s -XPOST localhost:3999/mock/fail   -d '{"status":400,"count":1,"op":"add"}'
+curl -s -XPOST localhost:3999/mock/config -d '{"dropRowIds":true}'        # reset: false
+curl -s -XPOST localhost:3999/mock/config -d '{"latencyMs":1500}'         # reset: 0
+curl -s -XPOST localhost:3999/mock/config -d '{"currencyIsDelta":true}'   # reset: false
+curl -s -XPOST localhost:3999/mock/reset
 ```
-mcp__foundry__run_macro {
-  name: "DDB Inventory Sync: Test",
-  timeoutMs: 600000,
-  args: { live: true, actor: "<test character Lars named>", configure: { proxyUrl: "", enabled: true, dryRun: false } }
-}
-```
+Reset each fault before the next one. The mock auto-creates characters by id, so mapping
+`111`/`222` to the test heroes is enough.
 
-`proxyUrl: ""` falls back to ddb-sync's real proxy. Without `live: true` and `actor`, the runner
-refuses to touch a real proxy. The *Player edits* step runs only against the mock. On a live
-run, also ask Lars to run **Run live self-test** from the settings and paste the whisper. That
-self-test checks the coin call semantics directly.
+## Phases 2 and 3 — real D&D Beyond
 
-## 3. Leave it as you found it
+Start only when Lars has given the campaign and character ids and says the cookie is in place.
+`configure.module.cobalt` accepts only `"MOCK"` or `""`. Set `""` so the real cookie is used. You
+never see, ask for, or set a real cookie. Live writes go only to the character Lars named, and
+the scenario runner refuses a real proxy without `live: true` and `actor`. The rest of the steps
+are in TEST-PLAN.md.
 
-After testing, ask Lars which state he wants. The usual choice is the real proxy with dry run on:
-`configure: { proxyUrl: "", dryRun: true }`. You can apply it with a run that executes no scenarios:
-`args: { only: [], configure: {...}, chat: false }`. Stop the mock process, and remind him to
-switch off *Allow the bridge to run macros*.
+The open assumptions the phase 2 self-test settles. Record each in the report:
+coin call sets or adds · `addItems` in the add answer · custom item quantity/remove via the
+inventory calls · party inventory via a member · whether the GM cookie may write to the character.
 
-## Rules
+## Reports
 
-- Never call the D&D Beyond proxy directly with write ops. Only the runner writes, and only to a
-  test character.
-- Never uncheck the safety flags: no `live: true` without Lars naming the test character in this
-  conversation.
-- Report failures verbatim (`name — detail`) and do not paraphrase them into "mostly works".
+Save every phase to `test-runs/<YYYY-MM-DD>-phase<N>.md` (gitignored):
+- the Dev `status` you started from
+- every report as a table (`name | status | detail`)
+- the fault matrix
+- the fixes you made, with their commits
+
+Quote failures verbatim. A phase is done only when its exit criteria in TEST-PLAN.md are all green.
+
+## Leave it as found
+
+At the end ask Lars what to leave. The default is
+`configure: { module: { dryRun: true, devRuntimeUrl: "" } }` plus `reloadPage`. Then stop your
+background processes and remind him to switch off *Allow the bridge to run macros*.

@@ -105,6 +105,13 @@ export function registerSettings(menus = {}) {
     config: true
   });
   client('characterCobalts', { type: Object, default: {}, config: false });
+  client('devRuntimeUrl', {
+    name: 'Dev runtime URL (this browser)',
+    hint: 'Development only: load the module code from the local dev server (npm run dev, e.g. http://localhost:3997/runtime.js) so a new build can be reloaded without reloading Foundry. Leave empty for normal use.',
+    type: String,
+    default: '',
+    config: true
+  });
   client('debug', { name: 'Debug logging', hint: 'Also print skipped changes to the console.', type: Boolean, default: false, config: true });
 }
 

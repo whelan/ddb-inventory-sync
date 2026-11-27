@@ -25,7 +25,7 @@ const potion = (quantity = 1, extra = {}) => ({ name: 'Potion of Healing', type:
 before(async () => {
   await new Promise((r) => mock.server.listen(0, r));
   const url = `http://127.0.0.1:${mock.server.address().port}`;
-  await import('../scripts/main.js');
+  const main = await import('../scripts/main.js');
   F.Hooks.call('init');
   F.set('ddb-sync', 'characterMapping', { 111: 'pc1', 222: 'pc2' });
   F.set('ddb-sync', 'proxyUrl', url);
@@ -39,6 +39,7 @@ before(async () => {
   F.addActor({ id: 'party', name: 'Party Stash' });
   F.addActor({ id: 'merchant', name: 'Bildrath', currency: { gp: 500 } });
   F.Hooks.call('ready');
+  await main.ready;
   api = game.modules.get(MODULE_ID).api;
 });
 

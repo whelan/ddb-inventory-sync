@@ -99,7 +99,13 @@ Every situation and the test that covers it: [docs/EDGE-CASES.md](docs/EDGE-CASE
 ```bash
 npm test        # unit + scenario tests (main.js in a Foundry stand-in, against the mock over HTTP)
 npm run mock    # mock ddb-proxy + D&D Beyond with a live status page on http://localhost:3999
+npm run dev     # rebuild scripts/runtime.js on save, serve it on http://localhost:3997/runtime.js
 ```
 
+`scripts/main.js` is a small bootstrap; the rest (`scripts/runtime.js`) can be hot-swapped. Set
+the client setting *Dev runtime URL* to the dev server and run the world macro
+**DDB Inventory Sync: Dev** with `{ action: "reload" }`. That works in a local world and on
+The Forge, without reloading Foundry. See [docs/TEST-PLAN.md](docs/TEST-PLAN.md).
+
 `scripts/core/` is pure and unit-tested (matcher, planner, queue, engine, targets, linker,
-client, selftest); `scripts/main.js` is the Foundry glue.
+client, selftest, scenarios); `scripts/runtime.js` is the Foundry glue.
