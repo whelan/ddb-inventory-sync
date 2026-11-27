@@ -1,0 +1,17 @@
+{
+  "name": "ddb-inventory-sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Foundry VTT module: Item Piles / Foundry inventory -> D&D Beyond via ddb-proxy",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "mock": "node tools/mock-proxy.js",
+    "dev": "node tools/dev-server.js",
+    "mock:watch": "node --watch tools/mock-proxy.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.25.10"
+  }
+}

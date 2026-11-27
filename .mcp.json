@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "foundry": {
+      "command": "node",
+      "args": ["../foundry-mcp-bridge/scripts/start-mcp-server.mjs"],
+      "env": {
+        "RELAY_URL": "ws://localhost:8787",
+        "FOUNDRY_TOOLS": "core,table"
+      }
+    }
+  }
+}
