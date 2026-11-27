@@ -23,6 +23,18 @@ The Forge cannot call it. Writes go through your own **ddb-proxy** (the one ddb-
 uses), which needs the `/proxy/inventory` route from `whelan/ddb-proxy`. The route forwards a
 fixed whitelist of operations and fields — nothing else passes.
 
+## Install
+
+Manifest URL — Foundry (*Add-on Modules → Install Module → Manifest URL*) and **The Forge**
+(*Bazaar → Install via manifest*, or *Configure → Add-on Modules → Install via manifest*):
+
+```
+https://github.com/whelan/ddb-inventory-sync/releases/latest/download/module.json
+```
+
+Updates arrive through the same URL. A release is published by the Release workflow whenever
+`main` carries a `module.json` version that has no release yet — bump `version`, merge.
+
 ## Setup
 
 1. Update and restart your ddb-proxy with the `/proxy/inventory` route.
